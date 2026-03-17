@@ -1,12 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from twilio.rest import Client
+from huggingface_hub import hf_hub_download
+import pandas as pd
 import random
 import time
 import os
+import threading
 
 app = FastAPI()
 
@@ -22,11 +25,7 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────
-# TWILIO — loaded from Railway environment variables ONLY
-# Set in Railway dashboard → your service → Variables:
-#   TWILIO_ACCOUNT_SID   = ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-#   TWILIO_AUTH_TOKEN    = your_auth_token
-#   TWILIO_PHONE         = +1xxxxxxxxxx
+# TWILIO — set in Railway → Variables
 # ─────────────────────────────────────────────
 ACCOUNT_SID  = os.environ.get("TWILIO_ACCOUNT_SID")
 AUTH_TOKEN   = os.environ.get("TWILIO_AUTH_TOKEN")
@@ -35,6 +34,56 @@ TWILIO_PHONE = os.environ.get("TWILIO_PHONE")
 _twilio_client = None
 if ACCOUNT_SID and AUTH_TOKEN:
     _twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN)
+
+# ─────────────────────────────────────────────
+# DATASET — loaded from Hugging Face at startup
+# Set in Railway → Variables:
+#   HF_TOKEN = hf_xxxxxxxxxxxxxxxxxxxxxxxxxx
+# ─────────────────────────────────────────────
+HF_TOKEN     = os.environ.get("HF_TOKEN")
+HF_REPO_ID   = "pranav4797/PS_20174392719_1491204439457_log"
+HF_FILENAME  = "PS_20174392719_1491204439457_log.csv"
+CACHE_PATH   = "/tmp/fraud_dataset.csv"
+
+# Global dataframe + status — loaded in background thread
+df: pd.DataFrame | None = None
+dataset_status = {"ready": False, "error": None, "rows": 0}
+
+
+def load_dataset():
+    """Download dataset from Hugging Face and load into memory."""
+    global df
+    try:
+        print("[Dataset] Starting download from Hugging Face...")
+
+        # Use cached file if already present (Railway container restart)
+        if os.path.exists(CACHE_PATH):
+            print("[Dataset] Found cached file, loading...")
+        else:
+            path = hf_hub_download(
+                repo_id=HF_REPO_ID,
+                filename=HF_FILENAME,
+                repo_type="dataset",
+                token=HF_TOKEN,
+                local_dir="/tmp",
+            )
+            # Rename to known cache path for clarity
+            if path != CACHE_PATH:
+                os.rename(path, CACHE_PATH)
+
+        df = pd.read_csv(CACHE_PATH)
+        dataset_status["ready"] = True
+        dataset_status["rows"]  = len(df)
+        print(f"[Dataset] Loaded {len(df):,} rows ✅")
+
+    except Exception as e:
+        dataset_status["error"] = str(e)
+        print(f"[Dataset] Failed to load: {e}")
+
+
+# Start loading in background so app starts instantly
+_loader = threading.Thread(target=load_dataset, daemon=True)
+_loader.start()
 
 # ─────────────────────────────────────────────
 # OTP STORE
@@ -91,7 +140,33 @@ def verify_otp(data: VerifyOTP):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Health check — also returns dataset load status."""
+    return {
+        "status": "ok",
+        "dataset": {
+            "ready": dataset_status["ready"],
+            "rows":  dataset_status["rows"],
+            "error": dataset_status["error"],
+        },
+    }
+
+
+@app.get("/api/dataset/status")
+def dataset_status_endpoint():
+    """Check if the dataset has finished loading."""
+    return JSONResponse(dataset_status)
+
+
+@app.get("/api/dataset/sample")
+def dataset_sample(n: int = 5):
+    """Return n sample rows from the dataset (for testing)."""
+    if not dataset_status["ready"]:
+        return JSONResponse(
+            {"error": "Dataset not ready yet.", "status": dataset_status},
+            status_code=503,
+        )
+    sample = df.head(n).to_dict(orient="records")
+    return {"rows": sample, "total": dataset_status["rows"]}
 
 
 # ─────────────────────────────────────────────
