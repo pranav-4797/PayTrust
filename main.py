@@ -4,8 +4,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from twilio.rest import Client
-from huggingface_hub import hf_hub_download
-import pandas as pd
 import random
 import time
 import os
@@ -36,54 +34,85 @@ if ACCOUNT_SID and AUTH_TOKEN:
     _twilio_client = Client(ACCOUNT_SID, AUTH_TOKEN)
 
 # ─────────────────────────────────────────────
-# DATASET — loaded from Hugging Face at startup
+# DATASET — Hugging Face, loaded in background
 # Set in Railway → Variables:
 #   HF_TOKEN = hf_xxxxxxxxxxxxxxxxxxxxxxxxxx
 # ─────────────────────────────────────────────
-HF_TOKEN     = os.environ.get("HF_TOKEN")
-HF_REPO_ID   = "pranav4797/PS_20174392719_1491204439457_log"
-HF_FILENAME  = "PS_20174392719_1491204439457_log.csv"
-CACHE_PATH   = "/tmp/fraud_dataset.csv"
+HF_TOKEN    = os.environ.get("HF_TOKEN")
+HF_REPO_ID  = "pranav4797/PS_20174392719_1491204439457_log"
+HF_FILENAME = "PS_20174392719_1491204439457_log.csv"
+CACHE_PATH  = "/tmp/fraud_dataset.csv"
 
-# Global dataframe + status — loaded in background thread
-df: pd.DataFrame | None = None
+df           = None
 dataset_status = {"ready": False, "error": None, "rows": 0}
 
 
+def _is_valid_csv(path: str) -> bool:
+    """Quick check: file exists, non-empty, and first line looks like a CSV header."""
+    try:
+        if not os.path.exists(path):
+            return False
+        if os.path.getsize(path) < 1024:          # less than 1 KB = broken
+            return False
+        with open(path, "r", errors="replace") as f:
+            first = f.readline()
+        return "," in first and len(first) > 5    # has comma-separated columns
+    except Exception:
+        return False
+
+
 def load_dataset():
-    """Download dataset from Hugging Face and load into memory."""
     global df
     try:
-        print("[Dataset] Starting download from Hugging Face...")
+        # Delete corrupt cache if it exists but fails validation
+        if os.path.exists(CACHE_PATH) and not _is_valid_csv(CACHE_PATH):
+            print("[Dataset] Cached file is corrupt — deleting and re-downloading...")
+            os.remove(CACHE_PATH)
 
-        # Use cached file if already present (Railway container restart)
         if os.path.exists(CACHE_PATH):
-            print("[Dataset] Found cached file, loading...")
+            print("[Dataset] Valid cache found — loading from /tmp ...")
         else:
-            path = hf_hub_download(
+            print("[Dataset] Downloading from Hugging Face...")
+            # Import here so startup doesn't fail if package missing
+            from huggingface_hub import hf_hub_download
+            downloaded = hf_hub_download(
                 repo_id=HF_REPO_ID,
                 filename=HF_FILENAME,
                 repo_type="dataset",
                 token=HF_TOKEN,
                 local_dir="/tmp",
             )
-            # Rename to known cache path for clarity
-            if path != CACHE_PATH:
-                os.rename(path, CACHE_PATH)
+            # Ensure it lands at our known CACHE_PATH
+            if os.path.abspath(downloaded) != os.path.abspath(CACHE_PATH):
+                import shutil
+                shutil.copy2(downloaded, CACHE_PATH)
 
-        df = pd.read_csv(CACHE_PATH)
+            # Validate what we just downloaded
+            if not _is_valid_csv(CACHE_PATH):
+                raise ValueError("Downloaded file failed CSV validation — may be corrupt or wrong format.")
+
+        # Load with pandas — use low_memory=False to avoid dtype warnings on large files
+        import pandas as pd
+        df = pd.read_csv(CACHE_PATH, low_memory=False)
+
         dataset_status["ready"] = True
         dataset_status["rows"]  = len(df)
-        print(f"[Dataset] Loaded {len(df):,} rows ✅")
+        print(f"[Dataset] ✅  Loaded {len(df):,} rows, {len(df.columns)} columns")
 
     except Exception as e:
         dataset_status["error"] = str(e)
-        print(f"[Dataset] Failed to load: {e}")
+        print(f"[Dataset] ❌  Failed: {e}")
+        # Remove broken cache so next restart tries a fresh download
+        if os.path.exists(CACHE_PATH):
+            try:
+                os.remove(CACHE_PATH)
+                print("[Dataset] Removed broken cache file.")
+            except Exception:
+                pass
 
 
-# Start loading in background so app starts instantly
-_loader = threading.Thread(target=load_dataset, daemon=True)
-_loader.start()
+# Load in background — app starts immediately
+threading.Thread(target=load_dataset, daemon=True).start()
 
 # ─────────────────────────────────────────────
 # OTP STORE
@@ -140,7 +169,6 @@ def verify_otp(data: VerifyOTP):
 
 @app.get("/health")
 def health():
-    """Health check — also returns dataset load status."""
     return {
         "status": "ok",
         "dataset": {
@@ -152,21 +180,18 @@ def health():
 
 
 @app.get("/api/dataset/status")
-def dataset_status_endpoint():
-    """Check if the dataset has finished loading."""
+def api_dataset_status():
     return JSONResponse(dataset_status)
 
 
 @app.get("/api/dataset/sample")
-def dataset_sample(n: int = 5):
-    """Return n sample rows from the dataset (for testing)."""
-    if not dataset_status["ready"]:
+def api_dataset_sample(n: int = 5):
+    if not dataset_status["ready"] or df is None:
         return JSONResponse(
             {"error": "Dataset not ready yet.", "status": dataset_status},
             status_code=503,
         )
-    sample = df.head(n).to_dict(orient="records")
-    return {"rows": sample, "total": dataset_status["rows"]}
+    return {"rows": df.head(n).to_dict(orient="records"), "total": dataset_status["rows"]}
 
 
 # ─────────────────────────────────────────────
