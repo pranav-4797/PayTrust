@@ -1,16 +1,7 @@
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
-
-# Environment secrets — NEVER commit these
 .env
-.env.local
-.env.production
-
-# OS
+.venv
+venv/
 .DS_Store
-Thumbs.db
+*.log
