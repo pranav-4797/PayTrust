@@ -2166,6 +2166,10 @@ function OTPModal({mobile,onSuccess,onCancel}){
     const t=setTimeout(()=>setTimer(p=>p-1),1000);
     return()=>clearTimeout(t);
   },[timer]);
+  /* Auto-send OTP as soon as this modal opens */
+  useEffect(()=>{
+    fetch(`${API}/send-otp`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mobile})}).catch(()=>{});
+  },[]);
 
   function type(i,e){
     const v=e.target.value.replace(/\D/,"");
